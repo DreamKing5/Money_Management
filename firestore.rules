@@ -1,0 +1,142 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function validDay(v) {
+      return v is int && v >= 1 && v <= 31;
+    }
+
+    function validSchedule(s) {
+      return s is map
+        && s.keys().hasOnly(['bank', 'closing', 'credit', 'salary'])
+        && s.keys().hasAll(['bank', 'closing', 'credit', 'salary'])
+        && validDay(s.bank) && validDay(s.closing)
+        && validDay(s.credit) && validDay(s.salary);
+    }
+
+    function validProfile(d) {
+      return d.keys().hasOnly(['name', 'avatar', 'shareId', 'schedule', 'defaultKind'])
+        && d.keys().hasAll(['name', 'avatar', 'shareId', 'schedule', 'defaultKind'])
+        && d.name is string && d.name.size() >= 1 && d.name.size() <= 40
+        && d.avatar is int && d.avatar >= 0 && d.avatar <= 5
+        && d.shareId is string
+        && validSchedule(d.schedule)
+        && d.defaultKind in ['bank', 'closing', 'credit', 'salary'];
+    }
+
+    // 共有ID(OS-XXXXXXXXXX) -> uid の対応表。ID を知っている人だけが get で引ける。一覧取得は不可。
+    match /shareIds/{shareId} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && shareId.matches('^OS-[0-9A-F]{10}$')
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // 公開プロフィール(表示名・アイコン・共有ID・支払い日の目安)。get のみ。一覧取得は不可。
+    match /profiles/{uid} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if isOwner(uid)
+        && validProfile(request.resource.data)
+        && getAfter(/databases/$(database)/documents/shareIds/$(request.resource.data.shareId)).data.uid == uid;
+      allow update: if isOwner(uid)
+        && validProfile(request.resource.data)
+        && request.resource.data.shareId == resource.data.shareId;
+      allow delete: if false;
+    }
+
+    // 自分のメンバー一覧。本人だけが読み書きできる。
+    match /users/{uid}/contacts/{peer} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid)
+        && peer != uid
+        && exists(/databases/$(database)/documents/profiles/$(peer))
+        && request.resource.data.keys().hasOnly(['addedAt'])
+        && request.resource.data.addedAt == request.time;
+      allow update, delete: if false;
+    }
+
+    function peerOf(d) {
+      return d.creator == d.lender ? d.borrower : d.lender;
+    }
+
+    function validNewTx(d) {
+      return d.keys().hasOnly(['lender', 'borrower', 'creator', 'participants', 'amount', 'memo', 'due', 'method', 'createdAt', 'status', 'approvals', 'splitId'])
+        && d.keys().hasAll(['lender', 'borrower', 'creator', 'participants', 'amount', 'memo', 'due', 'method', 'createdAt', 'status', 'approvals', 'splitId'])
+        && d.lender is string && d.borrower is string
+        && d.lender != d.borrower
+        && d.creator == request.auth.uid
+        && (d.creator == d.lender || d.creator == d.borrower)
+        && d.participants == [d.lender, d.borrower]
+        && d.amount is int && d.amount > 0 && d.amount <= 1000000000
+        && d.memo is string && d.memo.size() <= 500
+        && d.due is string && d.due.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && d.method in ['', '現金', 'PayPay', '振り込み', 'その他']
+        && d.createdAt == request.time
+        && d.status == 'pending'
+        && d.approvals == [d.creator]
+        && d.splitId is string && d.splitId.size() <= 40
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid)/contacts/$(peerOf(d)));
+    }
+
+    function validTxUpdate(old, next) {
+      return request.auth.uid in old.participants
+        && next.diff(old).affectedKeys().hasOnly(['status', 'approvals'])
+        && (
+          // 相手が承認 -> 双方承認済みなので返済予定へ
+          (old.status == 'pending'
+            && !(request.auth.uid in old.approvals)
+            && next.approvals == old.approvals.concat([request.auth.uid])
+            && next.status == 'active')
+          // 相手が辞退
+          || (old.status == 'pending'
+            && request.auth.uid != old.creator
+            && next.status == 'rejected'
+            && next.approvals == old.approvals)
+          // 作成者が取り消し
+          || (old.status == 'pending'
+            && request.auth.uid == old.creator
+            && next.status == 'cancelled'
+            && next.approvals == old.approvals)
+          // 借りた人が返済を報告
+          || (old.status == 'active'
+            && request.auth.uid == old.borrower
+            && next.status == 'repayment_pending'
+            && next.approvals == old.approvals)
+          // 貸した人が受取を確認
+          || (old.status == 'repayment_pending'
+            && request.auth.uid == old.lender
+            && next.status == 'repaid'
+            && next.approvals == old.approvals)
+          // 貸した人が未受取として差し戻し
+          || (old.status == 'repayment_pending'
+            && request.auth.uid == old.lender
+            && next.status == 'active'
+            && next.approvals == old.approvals)
+        );
+    }
+
+    match /transactions/{id} {
+      allow get, list: if signedIn() && request.auth.uid in resource.data.participants;
+      allow create: if signedIn() && validNewTx(request.resource.data);
+      allow update: if signedIn() && validTxUpdate(resource.data, request.resource.data);
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
